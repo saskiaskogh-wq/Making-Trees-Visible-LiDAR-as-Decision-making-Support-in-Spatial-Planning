@@ -1,0 +1,78 @@
+library(lidR)
+library(ForestTools)
+library(sf)
+library(terra)
+library(raster)
+
+# ── SETTINGS ──────────────────────────────────────────────────────────────────
+site_name  <- "site_name"
+las_path   <- "C:/Users/User/Documents/file.laz"
+output_dir <- "C:/Users/User/Documents/output_location"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+chm_path      <- file.path(output_dir, paste0("chm_",      site_name, ".tif"))
+treetops_path <- file.path(output_dir, paste0("treetops_", site_name, ".shp"))
+crowns_path   <- file.path(output_dir, paste0("crowns_",   site_name, ".shp"))
+las_seg_path  <- file.path(output_dir, paste0("las_seg_",  site_name, ".las"))
+log_path      <- file.path(output_dir, paste0("log_",      site_name, ".txt"))
+
+# ── Start timer ───────────────────────────────────────────────────────────────
+start_time <- Sys.time()
+
+# ── Processing ────────────────────────────────────────────────────────────────
+las <- readLAS(las_path)
+las <- normalize_height(las, tin())
+las <- filter_poi(las, Z >= 0, Z <= 50)
+
+# ── Treetop detection with li2012() (3D point cloud) ──────────────────────────
+las <- segment_trees(las, li2012(
+  dt1 = 7, dt2 = 9, R = 8, Zu = 10, hmin = 8, speed_up = 10
+))
+treetops <- crown_metrics(las, func = .stdtreemetrics, geom = "point")
+
+# ── CHM for crown segmentation ────────────────────────────────────────────────
+chm <- rasterize_canopy(
+  las,
+  res = 0.5,
+  algorithm = pitfree(
+    thresholds = c(0, 2, 5, 10, 15),
+    max_edge   = c(0, 1.5)
+  )
+)
+
+# ── Crown segmentation with mcws() using li2012 treetops as markers ───────────
+# mcws needs raster (not SpatRaster) and SpatialPointsDataFrame (not sf)
+chm_raster     <- raster::raster(chm)
+treetops_2d    <- st_zm(treetops, drop = TRUE, what = "ZM")
+treetops_sp    <- as(treetops_2d, "Spatial")
+crowns <- mcws(treetops_sp, chm_raster, minHeight = 2, format = "polygons")
+
+# ── Convert crowns back to sf for clean shapefile writing ─────────────────────
+crowns   <- st_as_sf(crowns)
+treetops <- treetops_2d  # already flattened above
+
+# ── Stop timer ────────────────────────────────────────────────────────────────
+end_time <- Sys.time()
+runtime  <- end_time - start_time
+
+# ── Output ────────────────────────────────────────────────────────────────────
+plot(chm)
+writeRaster(chm, chm_path, overwrite = TRUE)
+st_write(treetops, treetops_path, delete_layer = TRUE)
+st_write(crowns,   crowns_path,   delete_layer = TRUE)
+writeLAS(las, las_seg_path)
+
+# ── Log file ──────────────────────────────────────────────────────────────────
+log_text <- paste0(
+  "Site: ",       site_name, "\n",
+  "LAS file: ",   las_path, "\n",
+  "Started: ",    start_time, "\n",
+  "Finished: ",   end_time, "\n",
+  "Runtime: ",    format(runtime), "\n",
+  "Treetop algorithm: li2012(dt1=8, dt2=9, R=4, Zu=5, hmin=8, speed_up=10)\n",
+  "Crown algorithm: mcws() watershed on pitfree CHM (res=0.5)\n",
+  "Trees detected: ", nrow(treetops), "\n"
+)
+writeLines(log_text, log_path)
+cat("Done!\n", log_text)
