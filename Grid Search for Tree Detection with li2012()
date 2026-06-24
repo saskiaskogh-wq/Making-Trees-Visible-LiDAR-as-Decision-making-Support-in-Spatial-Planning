@@ -1,3 +1,13 @@
+# =============================================================
+# Script: li2012_grid_search.R
+# Description: Grid search parameter optimisation for point
+#              cloud-based tree detection (li2012)
+# Algorithm: Li et al. (2012)
+# Package: lidR (Roussel et al., 2023)
+# Author: Saskia Skogh
+# Date: 2026
+# =============================================================
+
 library(lidR)
 library(sf)
 library(terra)
