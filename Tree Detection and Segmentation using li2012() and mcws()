@@ -1,3 +1,12 @@
+# =============================================================
+# Script: li2012_tree_detection.R
+# Description: Point cloud-based tree detection (li2012)
+# Algorithm: Li et al. (2012)
+# Package: lidR (Roussel et al., 2023)
+# Author: Saskia Skogh
+# Date: 2026
+# =============================================================
+
 library(lidR)
 library(ForestTools)
 library(sf)
