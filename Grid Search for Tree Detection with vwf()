@@ -1,9 +1,3 @@
-# ============================================================
-# VWF Grid Search — Site 1 (GT = 7) & Site 2 (GT = 4)
-# Based on chm+tree_detection_plowright.R
-# Varying: slope, intercept  |  Fixed: hmin = 5 m
-# ============================================================
-
 library(lidR)
 library(ForestTools)
 library(sf)
