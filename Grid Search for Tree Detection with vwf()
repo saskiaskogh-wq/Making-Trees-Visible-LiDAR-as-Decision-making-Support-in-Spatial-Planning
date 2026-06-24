@@ -1,0 +1,217 @@
+# ============================================================
+# VWF Grid Search — Site 1 (GT = 7) & Site 2 (GT = 4)
+# Based on chm+tree_detection_plowright.R
+# Varying: slope, intercept  |  Fixed: hmin = 5 m
+# ============================================================
+
+library(lidR)
+library(ForestTools)
+library(sf)
+library(terra)
+library(dplyr)
+library(ggplot2)
+
+# ---- Search paths & constants ------------------------------------------
+site1_path <- "C:/Users/User/Documents/file1.laz"
+site2_path <- "C:/Users/User/Documents/file2.laz"
+out_dir    <- "C:/Users/User/Documents/output_location"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+GT1  <- 7
+GT2  <- 4
+HMIN <- 5
+
+# ---- Logging -------------------------------------------------------
+log_path <- file.path(out_dir, "gridsearch_vwf.log")
+log_con  <- file(log_path, open = "wt")
+tee <- function(...) {
+  msg <- paste0(...)
+  cat(msg, "\n")
+  cat(msg, "\n", file = log_con)
+}
+
+tee("VWF Grid Search started: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+
+# ---- Pipeline per site  ------------
+prepare_chm <- function(las_path, label) {
+  tee("\n[", label, "] Reading LAS...")
+  las <- readLAS(las_path)
+  tee("[", label, "] Points: ", nrow(las@data))
+
+  las <- normalize_height(las, tin())
+  las <- filter_poi(las, Z >= 0, Z <= 50)
+  las <- decimate_points(las, highest(res = 0.25))
+
+  tee("[", label, "] Building CHM...")
+  chm <- rasterize_canopy(
+    las,
+    res       = 0.5,
+    algorithm = pitfree(
+      thresholds = c(0, 2, 5, 10, 15),
+      max_edge   = c(0, 1.5),
+      subcircle  = 0.2
+    )
+  )
+  tee("[", label, "] CHM done.")
+  chm
+}
+
+chm1 <- prepare_chm(site1_path, "Site1")
+chm2 <- prepare_chm(site2_path, "Site2")
+
+# ---- Parameter grid --------------------------------------------------
+slopes     <- seq(0.05, 0.40, by = 0.025)
+intercepts <- seq(1.00, 5.00, by = 0.25)
+combos     <- expand.grid(slope = slopes, intercept = intercepts)
+N          <- nrow(combos)
+
+tee(sprintf("\nCombinations: %d (slope x intercept: %d x %d)",
+            N, length(slopes), length(intercepts)))
+
+# Factory function to avoid closure trap in loop
+make_win_fun <- function(slope, intercept) {
+  force(slope); force(intercept)
+  function(x) slope * x + intercept
+}
+
+# ---- Grid search loop ------------------------------------------------
+results      <- vector("list", N)
+partial_path <- file.path(out_dir, "gridsearch_vwf_partial.csv")
+t_start      <- proc.time()["elapsed"]
+
+for (i in seq_len(N)) {
+
+  slope_i <- combos$slope[i]
+  int_i   <- combos$intercept[i]
+  win_fun <- make_win_fun(slope_i, int_i)
+
+  t0 <- proc.time()["elapsed"]
+
+  out_row <- tryCatch({
+    ttops1 <- vwf(chm1, winFun = win_fun, minHeight = HMIN)
+    ttops2 <- vwf(chm2, winFun = win_fun, minHeight = HMIN)
+    n1      <- nrow(ttops1)
+    n2      <- nrow(ttops2)
+    elapsed <- proc.time()["elapsed"] - t0
+
+    data.frame(
+      slope          = slope_i,
+      intercept      = int_i,
+      ws_at_h5       = round(slope_i *  5 + int_i, 3),
+      ws_at_h15      = round(slope_i * 15 + int_i, 3),
+      ws_at_h30      = round(slope_i * 30 + int_i, 3),
+      detected_s1    = n1,
+      detected_s2    = n2,
+      diff_s1        = n1 - GT1,
+      diff_s2        = n2 - GT2,
+      abs_diff_s1    = abs(n1 - GT1),
+      abs_diff_s2    = abs(n2 - GT2),
+      total_abs_diff = abs(n1 - GT1) + abs(n2 - GT2),
+      runtime_sec    = round(elapsed, 2),
+      status         = "ok"
+    )
+  }, error = function(e) {
+    elapsed <- proc.time()["elapsed"] - t0
+    data.frame(
+      slope = slope_i, intercept = int_i,
+      ws_at_h5 = NA, ws_at_h15 = NA, ws_at_h30 = NA,
+      detected_s1 = NA, detected_s2 = NA,
+      diff_s1 = NA, diff_s2 = NA,
+      abs_diff_s1 = NA, abs_diff_s2 = NA,
+      total_abs_diff = NA,
+      runtime_sec = round(elapsed, 2),
+      status = paste0("error: ", conditionMessage(e))
+    )
+  })
+
+  results[[i]] <- out_row
+
+  if (i %% 10 == 0 || i == N) {
+    tee(sprintf("[%3d/%d] slope=%.3f int=%.2f -> S1=%s S2=%s  total_diff=%s  (%.1f s)",
+                i, N, slope_i, int_i,
+                ifelse(is.na(out_row$detected_s1), "ERR", out_row$detected_s1),
+                ifelse(is.na(out_row$detected_s2), "ERR", out_row$detected_s2),
+                ifelse(is.na(out_row$total_abs_diff), "NA", out_row$total_abs_diff),
+                out_row$runtime_sec))
+  }
+
+  if (i %% 25 == 0) {
+    write.csv(bind_rows(results[1:i]), partial_path, row.names = FALSE)
+  }
+}
+
+results_df <- bind_rows(results)
+
+# ---- Save results -------------------------------------------------
+full_csv <- file.path(out_dir, "gridsearch_vwf_results.csv")
+write.csv(results_df, full_csv, row.names = FALSE)
+tee("\nAll results: ", full_csv)
+
+top10 <- results_df %>%
+  filter(status == "ok") %>%
+  arrange(total_abs_diff, abs_diff_s1, abs_diff_s2) %>%
+  head(10)
+write.csv(top10, file.path(out_dir, "gridsearch_vwf_top10.csv"), row.names = FALSE)
+tee("Top 10: ", file.path(out_dir, "gridsearch_vwf_top10.csv"))
+
+tee("\n--- Top 10 ---")
+print(top10[, c("slope", "intercept", "ws_at_h5", "ws_at_h30",
+                "detected_s1", "detected_s2", "total_abs_diff")])
+
+# ---- Heatmaps -------------------------------------------------------
+tee("\nGenerating heatmaps...")
+plot_df <- results_df %>% filter(status == "ok")
+
+theme_gs <- theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+# Heatmap: total_abs_diff
+best_total <- plot_df %>% arrange(total_abs_diff, abs_diff_s1) %>% slice(1)
+p1 <- ggplot(plot_df, aes(x = slope, y = intercept, fill = total_abs_diff)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  geom_point(data = best_total, aes(x = slope, y = intercept),
+             colour = "red", shape = 8, size = 5, stroke = 1.5, inherit.aes = FALSE) +
+  scale_fill_viridis_c(name = "S|diff|", direction = -1) +
+  scale_x_continuous(breaks = slopes) +
+  scale_y_continuous(breaks = intercepts) +
+  labs(title = "VWF grid search — total |detected - GT| (Site 1 + Site 2)",
+       subtitle = sprintf("GT: Site1=%d, Site2=%d | hmin=%d m | Red star = best", GT1, GT2, HMIN),
+       x = "slope", y = "intercept") +
+  theme_gs
+ggsave(file.path(out_dir, "heatmap_total_abs_diff.png"), p1, width = 10, height = 7, dpi = 150)
+
+# Heatmap: Site 1
+best1 <- plot_df %>% arrange(abs_diff_s1) %>% slice(1)
+p2 <- ggplot(plot_df, aes(x = slope, y = intercept, fill = abs_diff_s1)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  geom_point(data = best1, aes(x = slope, y = intercept),
+             colour = "red", shape = 8, size = 5, stroke = 1.5, inherit.aes = FALSE) +
+  scale_fill_viridis_c(name = "|diff|", direction = -1) +
+  scale_x_continuous(breaks = slopes) +
+  scale_y_continuous(breaks = intercepts) +
+  labs(title = sprintf("VWF — Site 1 |detected - %d|", GT1), x = "slope", y = "intercept") +
+  theme_gs
+ggsave(file.path(out_dir, "heatmap_site1.png"), p2, width = 10, height = 7, dpi = 150)
+
+# Heatmap: Site 2
+best2 <- plot_df %>% arrange(abs_diff_s2) %>% slice(1)
+p3 <- ggplot(plot_df, aes(x = slope, y = intercept, fill = abs_diff_s2)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  geom_point(data = best2, aes(x = slope, y = intercept),
+             colour = "red", shape = 8, size = 5, stroke = 1.5, inherit.aes = FALSE) +
+  scale_fill_viridis_c(name = "|diff|", direction = -1) +
+  scale_x_continuous(breaks = slopes) +
+  scale_y_continuous(breaks = intercepts) +
+  labs(title = sprintf("VWF — Site 2 |detected - %d|", GT2), x = "slope", y = "intercept") +
+  theme_gs
+ggsave(file.path(out_dir, "heatmap_site2.png"), p3, width = 10, height = 7, dpi = 150)
+
+tee("Heatmaps saved.")
+
+# ---- Done ----------------------------------------------------------
+tee(sprintf("\nTotal runtime: %.1f minutes", (proc.time()["elapsed"] - t_start) / 60))
+tee("Finished: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+for (ln in capture.output(sessionInfo())) tee(ln)
+close(log_con)
+
+cat("Done! Files saved to:", out_dir, "\n")
