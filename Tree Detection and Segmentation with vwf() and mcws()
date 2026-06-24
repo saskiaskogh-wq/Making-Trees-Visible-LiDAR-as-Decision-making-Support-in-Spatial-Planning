@@ -1,0 +1,51 @@
+library(lidR)
+library(ForestTools)
+library(sf)
+library(terra)
+
+# ── SETTINGS (change site_name for each new site) ─────────────────────────────
+site_name  <- "Site2_vwf_opti"
+las_path   <- "C:/Users/User/Documents/file.laz"
+output_dir <- "C:/Users/User/Documents/output_location"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# Filenames automatically include site_name
+chm_path      <- file.path(output_dir, paste0("chm_",      site_name, ".tif"))
+treetops_path <- file.path(output_dir, paste0("treetops_", site_name, ".shp"))
+crowns_path   <- file.path(output_dir, paste0("crowns_",   site_name, ".shp"))
+
+# ── Processing ────────────────────────────────────────────────────────────────
+las <- readLAS(las_path)
+
+# ── Height normalisation ──────────────────────────────────────────────────────
+las <- normalize_height(las, tin())
+las <- filter_poi(las, Z >= 0, Z <= 50)
+
+# Keep highest point per 25 cm cell - perfect for CHM, much less memory
+las <- decimate_points(las, highest(res = 0.25))
+
+chm <- rasterize_canopy(
+  las,
+  res = 0.5,
+  algorithm = pitfree(
+    thresholds = c(0, 2, 5, 10, 15),
+    max_edge   = c(0, 1.5),
+    subcircle  = 0.2
+  )
+)
+
+win_fun  <- function(x) { x * 0.05 + 3 }
+treetops <- vwf(chm, winFun = win_fun, minHeight = 5)
+crowns   <- mcws(treetops, chm, minHeight = 5)
+
+# ── Output ────────────────────────────────────────────────────────────────────
+plot(chm)
+writeRaster(chm, chm_path, overwrite = TRUE)
+st_write(treetops, treetops_path, delete_layer = TRUE)
+writeVector(as.polygons(crowns), crowns_path, overwrite = TRUE)
+
+cat("Done! Files saved as:\n",
+    chm_path, "\n",
+    treetops_path, "\n",
+    crowns_path, "\n")
