@@ -1,0 +1,209 @@
+library(lidR)
+library(sf)
+library(terra)
+library(ggplot2)
+
+# ── SETTINGS (change site_name for each new site) ─────────────────────────────
+site_name    <- "Site_name"
+las_path     <- "C:/Users/User/Documents/file.laz"
+output_dir   <- "C:/Users/User/Documents/output_location"
+ground_truth <- 43   # field-inventoried tree count
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# Output paths
+results_csv  <- file.path(output_dir, paste0("grid_results_", site_name, ".csv"))
+top10_csv    <- file.path(output_dir, paste0("top10_",        site_name, ".csv"))
+scatter_path <- file.path(output_dir, paste0("scatter_",      site_name, ".png"))
+log_path     <- file.path(output_dir, paste0("log_",          site_name, ".txt"))
+
+# ── Start timer ───────────────────────────────────────────────────────────────
+total_start <- Sys.time()
+
+# ── Load and prepare point cloud ONCE ─────────────────────────────────────────
+cat("Loading and normalising point cloud...\n")
+las <- readLAS(las_path)
+las <- normalize_height(las, tin())
+las <- filter_poi(las, Z >= 0, Z <= 50)
+
+# ── Build parameter grid ──────────────────────────────────────────────────────
+# dt1: 1.5 to 8.0 (step 0.5)
+# dt2: dt1 + 1, dt1 + 2, dt1 + 3
+# Zu:  10 to 15 (step 1)
+# hmin = 8, R = 2 (locked)
+dt1_values  <- seq(1.5, 8.0, by = 0.5)
+dt2_offsets <- c(1, 2, 3)
+Zu_values   <- seq(10, 15, by = 1)
+hmin_fixed  <- 8
+R_fixed     <- 2
+speed_up    <- 10
+
+grid <- expand.grid(
+  dt1        = dt1_values,
+  dt2_offset = dt2_offsets,
+  Zu         = Zu_values
+)
+grid$dt2  <- grid$dt1 + grid$dt2_offset
+grid$hmin <- hmin_fixed
+grid$R    <- R_fixed
+
+cat("Grid contains", nrow(grid), "parameter combinations.\n\n")
+
+# ── Run grid search ───────────────────────────────────────────────────────────
+results <- data.frame(
+  dt1         = numeric(),
+  dt2         = numeric(),
+  Zu          = numeric(),
+  hmin        = numeric(),
+  R           = numeric(),
+  detected    = integer(),
+  diff        = integer(),
+  abs_diff    = integer(),
+  pct_match   = numeric(),
+  runtime_sec = numeric(),
+  status      = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_len(nrow(grid))) {
+  params     <- grid[i, ]
+  iter_start <- Sys.time()
+
+  cat(sprintf("[%d/%d] dt1=%.1f, dt2=%.1f, Zu=%d, hmin=%d, R=%d ... ",
+              i, nrow(grid), params$dt1, params$dt2, params$Zu,
+              params$hmin, params$R))
+
+  result <- tryCatch({
+    las_seg  <- segment_trees(las, li2012(
+      dt1      = params$dt1,
+      dt2      = params$dt2,
+      R        = params$R,
+      Zu       = params$Zu,
+      hmin     = params$hmin,
+      speed_up = speed_up
+    ))
+    treetops <- crown_metrics(las_seg, func = .stdtreemetrics, geom = "point")
+    list(detected = nrow(treetops), status = "ok")
+  }, error = function(e) {
+    list(detected = NA_integer_, status = paste("error:", e$message))
+  })
+
+  iter_end     <- Sys.time()
+  runtime_sec  <- as.numeric(difftime(iter_end, iter_start, units = "secs"))
+  diff_val     <- result$detected - ground_truth
+  abs_diff_val <- abs(diff_val)
+  pct_match    <- (result$detected / ground_truth) * 100
+
+  results <- rbind(results, data.frame(
+    dt1         = params$dt1,
+    dt2         = params$dt2,
+    Zu          = params$Zu,
+    hmin        = params$hmin,
+    R           = params$R,
+    detected    = result$detected,
+    diff        = diff_val,
+    abs_diff    = abs_diff_val,
+    pct_match   = round(pct_match, 1),
+    runtime_sec = round(runtime_sec, 2),
+    status      = result$status,
+    stringsAsFactors = FALSE
+  ))
+
+  cat(sprintf("detected=%s, runtime=%.1fs\n",
+              ifelse(is.na(result$detected), "NA", result$detected),
+              runtime_sec))
+
+  # Free memory between iterations
+  if (exists("las_seg")) rm(las_seg); gc(verbose = FALSE)
+}
+
+# ── Stop timer ────────────────────────────────────────────────────────────────
+total_end     <- Sys.time()
+total_runtime <- total_end - total_start
+
+# ── Save full results ─────────────────────────────────────────────────────────
+write.csv(results, results_csv, row.names = FALSE)
+
+# ── Top 10 results table ──────────────────────────────────────────────────────
+top10 <- results[order(results$abs_diff, results$runtime_sec), ][1:10, ]
+write.csv(top10, top10_csv, row.names = FALSE)
+
+cat("\n========== TOP 10 RESULTS ==========\n")
+print(top10, row.names = FALSE)
+
+# ── Scatter plot: Zu (y) vs dt1 (x), coloured by abs_diff ────────────────────
+results_ok <- results[results$status == "ok", ]
+
+p <- ggplot(results_ok, aes(x = dt1, y = Zu, colour = abs_diff)) +
+  geom_jitter(width = 0.1, height = 0.1, size = 3, alpha = 0.8) +
+  scale_colour_viridis_c(option = "plasma", direction = -1,
+                         name = "abs_diff\n(|detected - GT|)") +
+  scale_x_continuous(breaks = dt1_values) +
+  scale_y_continuous(breaks = Zu_values) +
+  labs(
+    title    = paste0("Grid search: li2012() detection error across dt1 x Zu"),
+    subtitle = paste0("hmin = ", hmin_fixed, " m, R = ", R_fixed,
+                      " m, ground truth = ", ground_truth, " trees"),
+    x = "dt1 (m)",
+    y = "Zu (m)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40")
+  )
+
+ggsave(scatter_path, p, width = 9, height = 6, dpi = 300)
+print(p)
+
+# ── Log file ──────────────────────────────────────────────────────────────────
+n_runs    <- nrow(results)
+n_ok      <- sum(results$status == "ok")
+n_errors  <- sum(results$status != "ok")
+best_diff <- min(results$abs_diff, na.rm = TRUE)
+n_at_best <- sum(results$abs_diff == best_diff, na.rm = TRUE)
+mean_iter <- mean(results$runtime_sec, na.rm = TRUE)
+
+log_text <- paste0(
+  "================ GRID SEARCH LOG ================\n",
+  "Site: ",             site_name, "\n",
+  "LAS file: ",         las_path, "\n",
+  "Ground truth: ",     ground_truth, " trees\n",
+  "\n",
+  "Started: ",          total_start, "\n",
+  "Finished: ",         total_end, "\n",
+  "Total runtime: ",    format(total_runtime), "\n",
+  "Mean per iteration: ", round(mean_iter, 2), " s\n",
+  "\n",
+  "------------ Parameter ranges -----------\n",
+  "dt1:  ", paste(dt1_values, collapse = ", "), " m\n",
+  "dt2:  dt1 + ", paste(dt2_offsets, collapse = ", "), " m\n",
+  "Zu:   ", paste(Zu_values, collapse = ", "), " m\n",
+  "hmin: ", hmin_fixed, " m (fixed)\n",
+  "R:    ", R_fixed, " m (fixed)\n",
+  "speed_up: ", speed_up, "\n",
+  "\n",
+  "------------ Run summary ----------------\n",
+  "Total combinations: ", n_runs, "\n",
+  "Successful runs:    ", n_ok, "\n",
+  "Failed runs:        ", n_errors, "\n",
+  "\n",
+  "------------ Best result ----------------\n",
+  "Lowest abs_diff:    ", best_diff, "\n",
+  "Combinations tied at best: ", n_at_best, "\n",
+  "\n",
+  "------------ Top 10 ---------------------\n"
+)
+
+top10_text <- capture.output(print(top10, row.names = FALSE))
+log_text   <- paste0(log_text, paste(top10_text, collapse = "\n"), "\n")
+
+writeLines(log_text, log_path)
+
+cat("\n========== DONE ==========\n")
+cat("Total runtime:", format(total_runtime), "\n")
+cat("Files saved to:", output_dir, "\n")
+cat("  - Full results: ", basename(results_csv),  "\n")
+cat("  - Top 10:       ", basename(top10_csv),    "\n")
+cat("  - Scatter plot: ", basename(scatter_path), "\n")
+cat("  - Log file:     ", basename(log_path),     "\n")
