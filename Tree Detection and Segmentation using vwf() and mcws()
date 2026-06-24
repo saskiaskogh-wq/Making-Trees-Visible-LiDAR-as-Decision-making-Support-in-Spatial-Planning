@@ -1,3 +1,12 @@
+# =============================================================
+# Script: vwf_tree_detection.R
+# Description: Variable window filter tree detection (vwf)
+# Algorithm: Popescu & Wynne (2004); Plowright (2026)
+# Package: ForestTools (Plowright, 2026)
+# Author: Saskia Skogh
+# Date: 2026
+# =============================================================
+
 library(lidR)
 library(ForestTools)
 library(sf)
